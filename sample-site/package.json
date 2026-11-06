@@ -1,0 +1,12 @@
+{
+  "name": "static-build-export-example",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependency-free example for Static Build Export",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}
