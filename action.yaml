@@ -1,12 +1,92 @@
-# action.yml
-name: 'Hello World'
-description: 'Greet someone and record the time'
+name: 'Static Build Export'
+description: 'Build a static site and publish its output to a dedicated Git branch'
 author: 'Praneeth Reddy Kolanu (@praneeth-rdy)'
+inputs:
+  token:
+    description: 'Token with contents: write access to the destination repository'
+    default: ${{ github.token }}
+  project-dir:
+    description: 'Application directory relative to the workspace (legacy: PROJECT_DIR)'
+  build-dir:
+    description: 'Output directory relative to project-dir (default: build; legacy: BUILD_DIR)'
+  branch:
+    description: 'Destination branch (default: build; legacy: BUILD_BRANCH)'
+  repository:
+    description: 'Destination owner/repository (default: workflow repository; legacy: TARGET_REPOSITORY)'
+  server-url:
+    description: 'GitHub HTTPS server URL (default: workflow server; legacy: GITHUB_HOSTNAME)'
+  node-version:
+    description: 'Node.js version for the built-in build'
+    default: '24'
+  package-manager:
+    description: 'auto, npm, or yarn (Yarn Classic must already be installed)'
+    default: 'auto'
+  skip-build:
+    description: 'Publish files already built by preceding steps'
+    default: 'false'
+  history:
+    description: 'preserve commits (default), or replace history with a snapshot'
+    default: 'preserve'
+outputs:
+  commit:
+    description: 'Destination commit SHA, including when output is unchanged'
+    value: ${{ steps.publish.outputs.commit }}
+  branch:
+    description: 'Destination branch'
+    value: ${{ steps.prepare.outputs.branch }}
+  repository:
+    description: 'Destination repository'
+    value: ${{ steps.prepare.outputs.repository }}
+  changed:
+    description: 'true when a new deployment commit was pushed, otherwise false'
+    value: ${{ steps.publish.outputs.changed }}
 runs:
-  using: 'docker'
-  image: 'Dockerfile'
-  # args:
-  #   - ${{ inputs.who-to-greet }}
+  using: 'composite'
+  steps:
+    - name: Validate configuration
+      id: prepare
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_PROJECT_DIR: ${{ inputs.project-dir }}
+        INPUT_BUILD_DIR: ${{ inputs.build-dir }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_SERVER_URL: ${{ inputs.server-url }}
+        INPUT_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        INPUT_SKIP_BUILD: ${{ inputs.skip-build }}
+        INPUT_HISTORY: ${{ inputs.history }}
+        ACTION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: bash "$ACTION_PATH/scripts/prepare.sh"
+    - name: Set up Node.js and dependency cache
+      if: inputs.skip-build != 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ steps.prepare.outputs.package-manager }}
+        cache-dependency-path: ${{ steps.prepare.outputs.lockfile }}
+        package-manager-cache: false
+    - name: Install dependencies and build
+      if: inputs.skip-build != 'true'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ACTION_PROJECT_DIR: ${{ steps.prepare.outputs.project-dir }}
+        ACTION_PACKAGE_MANAGER: ${{ steps.prepare.outputs.package-manager }}
+      run: bash "$ACTION_PATH/scripts/build.sh"
+    - name: Publish static output
+      id: publish
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ACTION_PROJECT_DIR: ${{ steps.prepare.outputs.project-dir }}
+        ACTION_BUILD_DIR: ${{ steps.prepare.outputs.build-dir }}
+        ACTION_BRANCH: ${{ steps.prepare.outputs.branch }}
+        ACTION_REPOSITORY: ${{ steps.prepare.outputs.repository }}
+        ACTION_SERVER_URL: ${{ steps.prepare.outputs.server-url }}
+        ACTION_HISTORY: ${{ inputs.history }}
+        ACTION_TOKEN: ${{ inputs.token }}
+      run: bash "$ACTION_PATH/entrypoint.sh"
 branding:
-  icon: 'zap'
+  icon: 'upload-cloud'
   color: 'green'

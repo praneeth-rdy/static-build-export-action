@@ -1,0 +1,26 @@
+name: Build and export the sample site
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: sample-site-build
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build and export this revision
+        uses: ./
+        with:
+          project-dir: sample-site
+          branch: sample-site-build

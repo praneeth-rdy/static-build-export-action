@@ -1,90 +1,74 @@
-#!/bin/sh
-set -e
-set -o pipefail
+#!/usr/bin/env bash
+set -euo pipefail
 
-# ENVIRONMENT VARIABLES:
-# [OPTIONAL]: TARGET_REPOSITORY, PROJECT_DIR, BUILD_DIR, BUILD_BRANCH, GITHUB_HOSTNAME
-# [MANDATORY]: TOKEN
+fail() { printf '::error::%s\n' "$*" >&2; exit 1; }
 
-# When does these optional env variables become mandatory?
-# TARGET_REPOSITORY: If you wish to deploy the BUILD_BRANCH to a different remote repository
-# PROJECT_DIR: If your project directory is not the repository's base directory
-# BUILD_DIR: If the static build is generated in a different directory and not in ${PROJECT_DIR}/build directory
-# BUILD_BRANCH: If you want to publish the build to different branch and not to 'build' branch
-# GITHUB_HOSTNAME: If the hostname of github, is not 'github.com'
+token=${TOKEN:-${ACTION_TOKEN:-}}
+[[ -n $token ]] || fail 'No GitHub token available. Grant contents: write to the job.'
+[[ $token != *$'\n'* && $token != *$'\r'* ]] || fail 'Invalid token.'
+printf '::add-mask::%s\n' "$token"
+build=$(cd "${ACTION_BUILD_DIR:?ACTION_BUILD_DIR is required}" && pwd -P) || fail 'Build directory does not exist.'
+workspace=$(cd "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}" && pwd -P)
+[[ $build == "$workspace/"* ]] || fail 'Build directory must be inside the workspace, below its root.'
+project=$(cd "${ACTION_PROJECT_DIR:?ACTION_PROJECT_DIR is required}" && pwd -P)
+[[ $build == "$project/"* ]] || fail 'Build directory must be below project-dir, not the application source directory.'
+[[ -n $(find "$build" -mindepth 1 -type f -print -quit) ]] || fail 'Build directory contains no files.'
+[[ -z $(find "$build" -name .git -print -quit) ]] || fail 'Build output must not contain .git metadata.'
+[[ -z $(find "$build" -type l -print -quit) ]] || fail 'Build output must not contain symbolic links.'
 
-# NOTE:
-# This action assumes that your project has a build script available in package.json which generates the static build using the necessary package.
-# BUILD_DIR is relative to PROJECT_DIR
-# You can use this action with other frameworks/libraries by just adding a 'build' script to package.json and passing the static build-directory path through BUILD_DIR env variable.
+branch=${ACTION_BRANCH:?ACTION_BRANCH is required}
+repository=${ACTION_REPOSITORY:?ACTION_REPOSITORY is required}
+history=${ACTION_HISTORY:-preserve}
+git check-ref-format --branch "$branch" >/dev/null || fail 'Invalid destination branch.'
+[[ $history == preserve || $history == replace ]] || fail 'Invalid history mode.'
 
+temporary=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/static-build-export.XXXXXX")
+trap 'rm -rf -- "$temporary"' EXIT
+umask 077
+cat > "$temporary/askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case $1 in
+    *Username*) printf '%s\n' 'x-access-token' ;;
+    *Password*) printf '%s\n' "$ACTION_PUSH_TOKEN" ;;
+esac
+ASKPASS
+chmod 700 "$temporary/askpass"
+# Only the publishing step receives the token. No token is stored in a URL or config.
+export ACTION_PUSH_TOKEN="$token"
+export GIT_ASKPASS="$temporary/askpass" GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset TOKEN ACTION_TOKEN token
 
+git init --initial-branch=export "$temporary/repository" >/dev/null
+cd "$temporary/repository"
+git config user.name 'github-actions[bot]'
+git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+git config credential.helper ''
+git remote add origin "${ACTION_SERVER_URL:?ACTION_SERVER_URL is required}/$repository.git"
 
-# SCRIPT:
-# Checks if the value of TARGET_REPOSITORY is empty
-# Checks for GITHUB_REPOSITORY, if it's empty
-# Exits with status code 1, if both of them are empty
-if [[ -z "$TARGET_REPOSITORY" ]]; then
-    if [[ -z "$GITHUB_REPOSITORY" ]]; then
-        echo "Set the GITHUB_REPOSITORY env variable."
-        exit 1
-    fi
-    TARGET_REPOSITORY=${GITHUB_REPOSITORY}
+previous=''
+remote_ref=$(git ls-remote --refs origin "refs/heads/$branch")
+if [[ -n $remote_ref ]]; then
+    git fetch --depth=1 origin "refs/heads/$branch"
+    previous=$(git rev-parse FETCH_HEAD)
+fi
+cp -a "$build/." .
+git add --all --force .
+tree=$(git write-tree)
+if [[ -n $previous && $tree == "$(git rev-parse "$previous^{tree}")" ]]; then
+    printf 'Output is unchanged; skipping deployment.\n'
+    printf 'commit=%s\nchanged=false\n' "$previous" >> "$GITHUB_OUTPUT"
+    exit 0
 fi
 
-# TOKEN is the GitHub Personal Access Token to access and push the build code to the target repository's new/existing branch.
-# Checks for token and exits with an error code, if it's empty.
-if [[ -z "$TOKEN" ]]; then
-    echo "Set the TOKEN env variable which can access the $TARGET_REPOSITORY"
-    exit 1
+# Reuse the parent without checking out or copying the previous build's files.
+if [[ -n $previous && $history == preserve ]]; then
+    git reset --soft "$previous"
 fi
-
-# PROJECT_DIR is the directory is the base dir from where dir references are taken and where the package.json is found.
-# Assumes it as . by default
-if [[ -z "$PROJECT_DIR" ]]; then
-    PROJECT_DIR="."
+git commit -m "Deploy static build to $branch" >/dev/null
+if [[ $history == replace ]]; then
+    git push "--force-with-lease=refs/heads/$branch:$previous" origin "HEAD:refs/heads/$branch"
+else
+    git push origin "HEAD:refs/heads/$branch"
 fi
-
-# BUILD_DIR is the directory to where the static build will be output (relative to PROJECT_DIR) on executing the command yarn build.
-# Assumes it as ./build by default
-if [[ -z "$BUILD_DIR" ]]; then
-    BUILD_DIR="build"
-fi
-
-# BUILD_BRANCH is the branch where the build is deployed.
-# Takes it as 'build' by default
-if [[ -z "$BUILD_BRANCH" ]]; then
-    BUILD_BRANCH="build"
-fi
-
-# If empty, sets the value of GITHUB_HOSTNAME variable as github.com i.e. default value
-if [[ -z "$GITHUB_HOSTNAME" ]]; then
-    GITHUB_HOSTNAME="github.com"
-fi
-
-main() {
-    echo "Starting build..."
-
-    remote_repo="https://${TOKEN}@${GITHUB_HOSTNAME}/${TARGET_REPOSITORY}.git"
-    # remote_branch=$BUILD_BRANCH
-
-    echo "Using yarn $(yarn --version)"
-
-    cd $PROJECT_DIR
-
-    echo "Install yarn dependencies"
-    yarn install --frozen-lockfile --silent
-
-    echo "Building in $(pwd) directory"
-    yarn build
-
-    cd $BUILD_DIR
-    git init
-    git config --local user.email "action@github.com"
-    git config --local user.name "GitHub Action"
-    git add -f .
-    git commit -m "Deploy the static build to ${BUILD_BRANCH} branch of ${TARGET_REPOSITORY}"
-    git push --force ${remote_repo} master:${BUILD_BRANCH}
-}
-
-main "$@"
+printf 'commit=%s\nchanged=true\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
